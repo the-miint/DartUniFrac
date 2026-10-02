@@ -586,30 +586,89 @@ pub fn build_sketches(
 // it would mean routing the binary's distances through this crate, which would
 // cost the binary its SIMD kernel.
 
-/// Positions compared per chunk by the lane counters.
-const LANES: usize = 32;
+/// Positions compared per chunk, with wide vectors available.
+///
+/// Not a free parameter, and not a micro-optimisation; see [`count_mismatches`].
+const WIDE_LANES: usize = 128;
+
+/// Positions compared per chunk otherwise.
+const NARROW_LANES: usize = 32;
+
+/// Chunk width for an element of `bytes` bytes, resolved at compile time.
+///
+/// The right width depends on the vector unit *and* on the element width,
+/// because LLVM's auto-vectoriser fails differently in each combination. See
+/// [`count_mismatches`] for the measurements.
+const fn lanes_for(bytes: usize) -> usize {
+    if cfg!(target_feature = "avx512f") {
+        WIDE_LANES
+    } else if cfg!(target_feature = "avx2") {
+        // The one combination where a wide chunk loses.
+        if bytes >= 8 { NARROW_LANES } else { WIDE_LANES }
+    } else {
+        NARROW_LANES
+    }
+}
+
+/// Count mismatching positions using `L` independent `u16` lane counters.
+///
+/// A counter gains at most 1 per chunk, so it could wrap past `L * u16::MAX`
+/// positions; processing the input in blocks of exactly that size and folding
+/// each block into a `usize` removes the bound entirely, leaving one code path
+/// that is correct for any slice.
+#[inline]
+fn count_mismatches_lanes<const L: usize, T: PartialEq + Copy>(a: &[T], b: &[T]) -> usize {
+    let block = L * u16::MAX as usize;
+    let mut acc: usize = 0;
+    for (ba, bb) in a.chunks(block).zip(b.chunks(block)) {
+        let mut lanes = [0u16; L];
+        let mut ai = ba.chunks_exact(L);
+        let mut bi = bb.chunks_exact(L);
+        for (ca, cb) in ai.by_ref().zip(bi.by_ref()) {
+            for j in 0..L {
+                lanes[j] += (ca[j] != cb[j]) as u16;
+            }
+        }
+        acc += lanes.iter().map(|&x| x as usize).sum::<usize>();
+        // Only the final block can leave a partial chunk, since the block size
+        // is a multiple of L.
+        for (x, y) in ai.remainder().iter().zip(bi.remainder().iter()) {
+            acc += (x != y) as usize;
+        }
+    }
+    acc
+}
 
 /// Number of positions at which two sketches differ.
 ///
 /// Exact at any length, which is what lets this replace a different kernel
 /// without moving a single output bit. See [`unifrac_from_sketches`].
 ///
-/// `LANES` independent `u16` counters accumulate one chunk at a time, which is the
-/// shape LLVM turns into packed compares plus packed adds. A counter gains at most
-/// 1 per chunk, so it could wrap past `LANES * u16::MAX` positions; processing the
-/// input in blocks of exactly that size and folding each block into a `usize`
-/// removes the bound entirely, leaving one code path that is correct for any
-/// slice.
+/// `L` independent `u16` counters accumulate one chunk at a time, which is the
+/// shape LLVM turns into packed compares plus packed adds.
 ///
-/// **The blocking is load-bearing for performance, not just for the bound.** A
-/// bare `chunks_exact` loop with a length guard instead of blocks is faster when
-/// the compiler has only SSE2 to work with, and was measured at 1.6x the nightly
-/// kernel there -- but it collapses as soon as wider vectors are available: 0.13x
-/// at AVX2 and 0.08x at AVX-512, i.e. slower *with* AVX2 enabled than with no
-/// vector unit at all. The blocked form holds within 6% of the nightly kernel at
-/// AVX2 and AVX-512 and is ahead of it at SSE2. Measured on Zen 5 across all
-/// three; a formulation that wins only at the ISA you happened to benchmark is
-/// not portable, which is the whole point of this crate.
+/// **The chunk width is chosen per ISA and per element width, because LLVM
+/// vectorises this loop differently — and sometimes pathologically — depending
+/// on the vector unit it is given.** All three were measured on Zen 5 at
+/// n = 4,000, k = 2,048, against the same source:
+///
+/// - **SSE2.** 32 lanes vectorises cleanly. 128 would cost 1.5-2x.
+/// - **AVX2.** At 32 lanes LLVM stops loading vectors and builds them an
+///   element at a time instead — 2,688 `vpinsrw` in the binary — costing 5.8x
+///   at `u16` and 3.7x at `u32`. 128 lanes restores it. `u64` is the exception
+///   and wants 32.
+/// - **AVX-512.** At 32 lanes LLVM fully unrolls the lane loop and vectorises
+///   the *enclosing* chunk loop instead. Across chunks `ca[j]` is strided, so
+///   contiguous loads become `vpgatherdd`/`vpgatherdq` — 384 of them, and
+///   gathers are microcoded on Zen. Measured at IPC 0.33 and a 10x loss at
+///   `u32`, 6x at `u64`. A chunk too wide to unroll keeps the lane loop as the
+///   one that gets vectorised.
+///
+/// This tunes a constant against one compiler's cost model rather than fixing
+/// anything semantically wrong, so treat the values as measurements rather than
+/// as derivations, and re-measure if the toolchain moves. What it cannot do is
+/// change a result: the count is an exact integer at every width, so the only
+/// thing a wrong choice costs is time.
 #[inline]
 fn count_mismatches<T: PartialEq + Copy>(a: &[T], b: &[T]) -> usize {
     assert_eq!(
@@ -617,25 +676,13 @@ fn count_mismatches<T: PartialEq + Copy>(a: &[T], b: &[T]) -> usize {
         b.len(),
         "sketches of different lengths are not comparable"
     );
-    const BLOCK: usize = LANES * u16::MAX as usize;
-    let mut acc: usize = 0;
-    for (ba, bb) in a.chunks(BLOCK).zip(b.chunks(BLOCK)) {
-        let mut lanes = [0u16; LANES];
-        let mut ai = ba.chunks_exact(LANES);
-        let mut bi = bb.chunks_exact(LANES);
-        for (ca, cb) in ai.by_ref().zip(bi.by_ref()) {
-            for j in 0..LANES {
-                lanes[j] += (ca[j] != cb[j]) as u16;
-            }
-        }
-        acc += lanes.iter().map(|&x| x as usize).sum::<usize>();
-        // Only the final block can leave a partial chunk, since BLOCK is a
-        // multiple of LANES.
-        for (x, y) in ai.remainder().iter().zip(bi.remainder().iter()) {
-            acc += (x != y) as usize;
-        }
+    // `size_of::<T>()` is a compile-time constant, so exactly one arm survives
+    // monomorphisation and the other costs nothing.
+    if lanes_for(core::mem::size_of::<T>()) == WIDE_LANES {
+        count_mismatches_lanes::<WIDE_LANES, T>(a, b)
+    } else {
+        count_mismatches_lanes::<NARROW_LANES, T>(a, b)
     }
-    acc
 }
 
 /// UniFrac between two sketches.
